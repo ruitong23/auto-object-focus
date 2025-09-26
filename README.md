@@ -45,6 +45,7 @@ Launch the interactive Gradio interface to configure the tracker, adjust motion 
 python -m auto_focus.webui
 ```
 
+
 ### Windows quick launch
 
 Windows users can double-click `run.bat` to automatically verify that the required Python packages are installed and launch the Gradio web interface. The script installs any missing dependencies before starting the app so a single click opens the UI.
