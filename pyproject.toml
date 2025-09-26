@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-object-focus"
+version = "0.1.0"
+description = "Automatic cursor focusing using YOLO object detection"
+readme = "README.md"
+authors = [{ name = "Auto Focus" }]
+requires-python = ">=3.9"
+dependencies = [
+    "ultralytics",
+    "opencv-python",
+    "numpy",
+    "pyautogui",
+    "mss",
+    "gradio",
+    "pynput",
+]
+
+[project.urls]
+Homepage = "https://example.com/auto-object-focus"
