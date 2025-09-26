@@ -33,6 +33,11 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
         "pyautogui is required to use AutoFocusController. Install the optional dependencies first."
     ) from exc
 
+try:  # pragma: no cover - optional runtime dependency
+    import pydirectinput  # type: ignore
+except ImportError:  # pragma: no cover - handled by falling back to pyautogui-only control
+    pydirectinput = None  # type: ignore[assignment]
+
 
 @dataclass
 class BoundingBox:
@@ -44,6 +49,52 @@ class BoundingBox:
 
 
 FrameProvider = Callable[[], Optional[np.ndarray]]
+
+
+class _RelativeInputAdapter:
+    """Delegate cursor actions to a base controller while using raw relative input when possible."""
+
+    def __init__(self, base_controller: object, relative_module: object) -> None:
+        self._base = base_controller
+        self._relative = relative_module
+
+    def size(self) -> Tuple[int, int]:
+        if not hasattr(self._base, "size"):
+            raise AttributeError("Base cursor controller does not expose size().")
+        return self._base.size()  # type: ignore[no-any-return]
+
+    def position(self):  # type: ignore[override]
+        if not hasattr(self._base, "position"):
+            raise AttributeError("Base cursor controller does not expose position().")
+        return self._base.position()  # type: ignore[no-any-return]
+
+    def moveTo(self, x: float, y: float) -> None:
+        mover = getattr(self._base, "moveTo", None)
+        if mover is None:
+            raise AttributeError("Base cursor controller does not expose moveTo().")
+        mover(x, y)
+
+    def moveRel(self, x: float, y: float) -> None:
+        relative_mover = getattr(self._relative, "moveRel", None)
+        if callable(relative_mover):
+            dx = int(round(x))
+            dy = int(round(y))
+            if dx == 0 and abs(x) >= 1e-6:
+                dx = 1 if x > 0 else -1
+            if dy == 0 and abs(y) >= 1e-6:
+                dy = 1 if y > 0 else -1
+            if dx == 0 and dy == 0:
+                return
+            relative_mover(dx, dy)
+            return
+
+        base_mover = getattr(self._base, "moveRel", None)
+        if base_mover is None:
+            raise AttributeError("Cursor controller does not expose moveRel().")
+        base_mover(float(x), float(y))
+
+    def __getattr__(self, item):  # pragma: no cover - defensive delegation
+        return getattr(self._base, item)
 
 
 class AutoFocusController:
@@ -114,8 +165,12 @@ class AutoFocusController:
         self.smoothing_factor = smoothing_factor
         self.tracking_speed = tracking_speed
         self.distance_ratio = distance_ratio
-        self.cursor_controller = cursor_controller if cursor_controller is not None else pyautogui
         self.mode = mode_normalized
+
+        base_cursor = cursor_controller if cursor_controller is not None else pyautogui
+        if cursor_controller is None and self.mode == "3d":
+            base_cursor = self._create_3d_cursor_controller(base_cursor)
+        self.cursor_controller = base_cursor
 
         self.screen_width, self.screen_height = self._normalize_screen_size(self.cursor_controller.size())
         self._screen_center = np.array([self.screen_width / 2.0, self.screen_height / 2.0], dtype=float)
@@ -295,6 +350,14 @@ class AutoFocusController:
         # next set of deltas continue from a neutral position even if the cursor is visible.
         if hasattr(self.cursor_controller, "moveTo"):
             self.cursor_controller.moveTo(int(self._screen_center[0]), int(self._screen_center[1]))
+
+    def _create_3d_cursor_controller(self, base_controller: object) -> object:
+        """Wrap the cursor controller to prefer raw relative input when available."""
+
+        if pydirectinput is None:
+            return base_controller
+
+        return _RelativeInputAdapter(base_controller, pydirectinput)
 
     def _resolve_target_id(self) -> Optional[int]:
         """Resolve the numeric class identifier for the configured target."""

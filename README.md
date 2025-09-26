@@ -39,7 +39,8 @@ Additional options include:
 - `--distance-ratio` to scale how much faster the cursor moves when the target is far from the center (default `2.0`).
 - `--model` to provide a custom YOLO weights file.
 - `--mode` to switch between the desktop cursor controller (`2d`, default) and a relative-input controller suited for 3D
-  applications (`3d`).
+  applications (`3d`). The 3D mode now prefers [PyDirectInput](https://github.com/learncodebygaming/pydirectinput) when
+  available so games that capture the mouse still receive relative motion events.
 
 Press `Ctrl+C` to stop the controller.
 
