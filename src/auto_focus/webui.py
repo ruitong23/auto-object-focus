@@ -321,6 +321,7 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
     return demo
 
 
+
 def main() -> None:
     """Entry point for ``python -m auto_focus.webui``."""
 
