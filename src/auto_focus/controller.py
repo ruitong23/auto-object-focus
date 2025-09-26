@@ -230,9 +230,6 @@ class AutoFocusController:
         current_position = self._get_cursor_position()
         movement_vector = desired_position - current_position
 
-        if np.allclose(movement_vector, 0):
-            return
-
         distance_norm = float(np.linalg.norm(self._smoothed_offset))
         effective_speed = min(1.0, self.tracking_speed + self.distance_ratio * distance_norm)
         target_position = current_position + movement_vector * effective_speed

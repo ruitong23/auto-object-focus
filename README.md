@@ -50,7 +50,6 @@ python -m auto_focus.webui
 
 Windows users can double-click `run.bat` to automatically verify that the required Python packages are installed and launch the Gradio web interface. The script installs any missing dependencies before starting the app so a single click opens the UI.
 
-
 The interface provides:
 
 - Text inputs for the target class or ID and model weights.
