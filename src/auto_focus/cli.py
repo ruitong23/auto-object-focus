@@ -40,10 +40,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Path to the YOLO model weights (default: yolov8n.pt).",
     )
     parser.add_argument(
-        "--mode",
-        choices=["2d", "3d"],
-        default="2d",
-        help="Choose between moving the desktop cursor (2d) or emitting relative input for 3D applications.",
+        "--monitor",
+        type=int,
+        default=0,
+        help="Index of the monitor to capture (0 captures the entire desktop).",
+    )
+    parser.add_argument(
+        "--debug-visualization",
+        action="store_true",
+        help="Display a debug window showing detected bounding boxes.",
     )
     return parser.parse_args(argv)
 
@@ -61,7 +66,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         tracking_speed=args.tracking_speed,
         distance_ratio=args.distance_ratio,
         model_path=args.model,
-        mode=args.mode,
+        monitor_index=args.monitor,
+        debug_visualization=args.debug_visualization,
     )
 
     try:

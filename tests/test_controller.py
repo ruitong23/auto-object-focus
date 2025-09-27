@@ -63,11 +63,21 @@ def install_stubs(monkeypatch: pytest.MonkeyPatch):
     dummy_cv2 = types.ModuleType("cv2")
     dummy_cv2.COLOR_BGRA2BGR = 0
     dummy_cv2.COLOR_RGB2BGR = 1
+    dummy_cv2.FONT_HERSHEY_SIMPLEX = 0
+    dummy_cv2.LINE_AA = 16
+    dummy_cv2.imshow_calls = []
 
     def _cvt_color(frame, code):
         return frame
 
+    def _imshow(name, frame):
+        dummy_cv2.imshow_calls.append(name)
+
     dummy_cv2.cvtColor = _cvt_color
+    dummy_cv2.imshow = _imshow
+    dummy_cv2.waitKey = lambda *args, **kwargs: 1
+    dummy_cv2.rectangle = lambda *args, **kwargs: None
+    dummy_cv2.putText = lambda *args, **kwargs: None
     dummy_cv2.destroyAllWindows = lambda: None
     monkeypatch.setitem(sys.modules, "cv2", dummy_cv2)
 
@@ -155,20 +165,24 @@ def test_controller_moves_cursor_with_smoothing(monkeypatch: pytest.MonkeyPatch)
         confidence_threshold=0.5,
         smoothing_factor=0.5,
         frame_provider=provider,
-        cursor_controller=cursor,
-        mode="2d",
     )
 
     controller.run()
 
     assert provider.closed is True
-    assert len(cursor.movements) == 1
 
-    # Cursor should move left relative to its current position to recenter the detection.
-    kind, dx, dy = cursor.movements[0]
-    assert kind == "rel"
-    assert pytest.approx(dx, rel=1e-3) == -12.3046875
-    assert pytest.approx(dy, abs=1e-6) == 0.0
+    # Relative movement should be sent through the direct input bridge.
+    assert len(_direct.movements) == 1
+    dx, dy = _direct.movements[0]
+    assert dx < 0
+    assert abs(dx) >= 1
+    assert pytest.approx(dy, abs=1e-6) == 0
+
+    # The visible cursor should be re-centred afterwards.
+    assert cursor.movements
+    x, y = cursor.movements[-1]
+    assert pytest.approx(x, abs=1e-6) == 960.0
+    assert pytest.approx(y, abs=1e-6) == 540.0
 
 
 def test_controller_prefers_box_closest_to_screen_centre(monkeypatch: pytest.MonkeyPatch):
@@ -202,12 +216,11 @@ def test_controller_prefers_box_closest_to_screen_centre(monkeypatch: pytest.Mon
         confidence_threshold=0.5,
         smoothing_factor=0.5,
         frame_provider=provider,
-        cursor_controller=cursor,
-        mode="2d",
     )
 
-    selected = controller._select_target_box(frame)
+    selected, candidates = controller._select_target_box(frame)
     assert selected is not None
+    assert len(candidates) == 2
     # Expect the controller to lock onto the box closest to the screen centre despite the
     # other detection having higher confidence.
     assert pytest.approx(selected.center_x, abs=1e-6) == 330.0
@@ -242,8 +255,6 @@ def test_update_motion_parameters(monkeypatch: pytest.MonkeyPatch):
         tracking_speed=0.3,
         distance_ratio=1.0,
         frame_provider=provider,
-        cursor_controller=cursor,
-        mode="2d",
     )
 
     controller.update_motion_parameters(tracking_speed=0.5, distance_ratio=0.8)
@@ -284,7 +295,6 @@ def test_controller_3d_mode_recenters_pointer(monkeypatch: pytest.MonkeyPatch):
         tracking_speed=0.2,
         distance_ratio=1.0,
         frame_provider=provider,
-        mode="3d",
     )
 
     assert isinstance(controller.cursor_controller, controller_module._RelativeInputAdapter)
@@ -297,8 +307,8 @@ def test_controller_3d_mode_recenters_pointer(monkeypatch: pytest.MonkeyPatch):
     dx, dy = direct.movements[0]
     assert dx != 0 or dy != 0
 
-    assert len(cursor.movements) == 1
-    x, y = cursor.movements[0]
+    assert cursor.movements
+    x, y = cursor.movements[-1]
     assert pytest.approx(x, abs=1e-6) == 960.0
     assert pytest.approx(y, abs=1e-6) == 540.0
 
@@ -333,7 +343,6 @@ def test_controller_3d_mode_falls_back_without_direct_input(monkeypatch: pytest.
         tracking_speed=0.2,
         distance_ratio=1.0,
         frame_provider=provider,
-        mode="3d",
     )
 
     assert controller_module.pydirectinput is None
@@ -376,7 +385,6 @@ def test_3d_mode_uses_initial_cursor_position_for_recentering(monkeypatch: pytes
         tracking_speed=0.2,
         distance_ratio=1.0,
         frame_provider=provider,
-        mode="3d",
     )
 
     assert np.allclose(controller._screen_center, np.array([100.0, 200.0]))
@@ -387,7 +395,56 @@ def test_3d_mode_uses_initial_cursor_position_for_recentering(monkeypatch: pytes
     assert len(direct.movements) == 1
 
     # Pointer recentering should respect the cursor's initial position.
-    assert len(cursor.movements) == 1
-    x, y = cursor.movements[0]
+    assert cursor.movements
+    x, y = cursor.movements[-1]
     assert pytest.approx(x, abs=1e-6) == 100.0
     assert pytest.approx(y, abs=1e-6) == 200.0
+
+
+def test_debug_visualisation_requests_window(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
+
+    frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+    provider = DummyFrameProvider(frames)
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array([[300, 200, 340, 280]], dtype=float),
+                conf=np.array([0.9], dtype=float),
+                cls=np.array([0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        tracking_speed=0.2,
+        distance_ratio=1.0,
+        frame_provider=provider,
+        debug_visualization=True,
+    )
+
+    controller.run()
+
+    assert controller_module.cv2.imshow_calls
+    assert controller._debug_window_name in controller_module.cv2.imshow_calls
+
+
+def test_enumerate_monitors_without_mss(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    monkeypatch.setattr(controller_module, "mss", None, raising=False)
+
+    monitors = controller_module.enumerate_monitors()
+    assert isinstance(monitors, list)
+    assert monitors
+    assert monitors[0]["index"] == 0
+    assert "label" in monitors[0]

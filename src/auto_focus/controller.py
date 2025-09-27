@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from typing import Callable, Dict, Iterable, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -41,15 +41,71 @@ except ImportError:  # pragma: no cover - handled by falling back to pyautogui-o
 
 @dataclass
 class BoundingBox:
-    """Normalized bounding box and confidence information."""
+    """Bounding box and confidence information."""
 
     center_x: float
     center_y: float
     confidence: float
     distance: float
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+@dataclass
+class DebugCandidate:
+    """Information required to draw detections in the debug visualisation."""
+
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    confidence: float
+    center_x: float
+    center_y: float
 
 
 FrameProvider = Callable[[], Optional[np.ndarray]]
+
+
+def enumerate_monitors() -> List[Dict[str, Union[int, str]]]:
+    """Return metadata describing the monitors available for capture."""
+
+    monitors: List[Dict[str, Union[int, str]]] = []
+
+    if mss is not None:  # pragma: no branch - simple runtime selection
+        with mss.mss() as sct:
+            for index, monitor in enumerate(sct.monitors):
+                label = "All Monitors" if index == 0 else f"Monitor {index}"
+                monitors.append(
+                    {
+                        "index": index,
+                        "label": label,
+                        "width": int(monitor.get("width", 0)),
+                        "height": int(monitor.get("height", 0)),
+                        "left": int(monitor.get("left", 0)),
+                        "top": int(monitor.get("top", 0)),
+                    }
+                )
+        return monitors
+
+    try:
+        width, height = pyautogui.size()
+    except Exception:  # pragma: no cover - pyautogui failure
+        width, height = 0, 0
+
+    monitors.append(
+        {
+            "index": 0,
+            "label": "Primary Monitor",
+            "width": int(width),
+            "height": int(height),
+            "left": 0,
+            "top": 0,
+        }
+    )
+    return monitors
 
 
 class _RelativeInputAdapter:
@@ -110,7 +166,8 @@ class AutoFocusController:
         tracking_speed: float = 0.2,
         distance_ratio: float = 2.0,
         model_path: str = "yolov8n.pt",
-        mode: str = "2d",
+        monitor_index: int = 0,
+        debug_visualization: bool = False,
         cursor_controller: Optional[object] = None,
         frame_provider: Optional[FrameProvider] = None,
     ) -> None:
@@ -140,11 +197,12 @@ class AutoFocusController:
             Optional callable returning the next video frame as a NumPy array. When not
             supplied a screenshot-based provider is used to track objects displayed on
             the screen.
-        mode:
-            ``"2d"`` moves the desktop cursor toward the detection. ``"3d"`` emits
-            relative mouse input and recentres the pointer so games that lock the
-            cursor keep their aim aligned with the detected target.
-        """
+        monitor_index:
+            Index of the monitor to capture. ``0`` captures the entire virtual desktop
+            while values ``>= 1`` select a specific display reported by :mod:`mss`.
+        debug_visualization:
+            When ``True`` a debug window overlays the detections used to steer the cursor.
+    """
 
         if not 0 < smoothing_factor <= 1:
             raise ValueError("smoothing_factor must be between 0 (exclusive) and 1 (inclusive)")
@@ -156,24 +214,28 @@ class AutoFocusController:
         if distance_ratio < 0:
             raise ValueError("distance_ratio must be non-negative")
 
-        mode_normalized = mode.lower()
-        if mode_normalized not in {"2d", "3d"}:
-            raise ValueError("mode must be either '2d' or '3d'")
-
         self.model = YOLO(model_path)
         self.model_target = target_class
         self.confidence_threshold = confidence_threshold
         self.smoothing_factor = smoothing_factor
         self.tracking_speed = tracking_speed
         self.distance_ratio = distance_ratio
-        self.mode = mode_normalized
+        self.monitor_index = int(monitor_index)
+        self._debug_visualization = bool(debug_visualization)
+        self._debug_window_name = "AutoFocus Detection Debug"
 
         base_cursor = cursor_controller if cursor_controller is not None else pyautogui
-        if cursor_controller is None and self.mode == "3d":
+        if cursor_controller is None:
             base_cursor = self._create_3d_cursor_controller(base_cursor)
         self.cursor_controller = base_cursor
 
-        self.screen_width, self.screen_height = self._normalize_screen_size(self.cursor_controller.size())
+        self._frame_provider = frame_provider if frame_provider is not None else self._create_frame_provider()
+
+        capture_size = getattr(self._frame_provider, "capture_size", None)
+        if capture_size is not None:
+            self.screen_width, self.screen_height = self._normalize_screen_size(capture_size)
+        else:
+            self.screen_width, self.screen_height = self._normalize_screen_size(self.cursor_controller.size())
         self._screen_center = np.array([self.screen_width / 2.0, self.screen_height / 2.0], dtype=float)
 
         if hasattr(self.cursor_controller, "position"):
@@ -191,7 +253,6 @@ class AutoFocusController:
         self._smoothed_offset = np.zeros(2, dtype=float)
         self._running = False
         self._closed = False
-        self._frame_provider = frame_provider if frame_provider is not None else self._create_frame_provider()
         self._frame_provider_close = getattr(self._frame_provider, "close", None)
 
     def run(self) -> None:
@@ -208,7 +269,10 @@ class AutoFocusController:
                 if frame is None:
                     break
 
-                box = self._select_target_box(frame)
+                box, candidates = self._select_target_box(frame)
+                if self._debug_visualization:
+                    self._render_debug_frame(frame, candidates, box)
+
                 if box is None:
                     continue
 
@@ -256,18 +320,19 @@ class AutoFocusController:
                 raise ValueError("distance_ratio must be non-negative")
             self.distance_ratio = float(distance_ratio)
 
-    def _select_target_box(self, frame: np.ndarray) -> Optional[BoundingBox]:
+    def _select_target_box(self, frame: np.ndarray) -> Tuple[Optional[BoundingBox], List[DebugCandidate]]:
         """Run the YOLO model on the frame and select the best matching bounding box."""
 
         results = self.model(frame)
         if not results:
-            return None
+            return None, []
 
         target_id = self._resolve_target_id()
         best_box: Optional[BoundingBox] = None
         best_distance = float("inf")
         frame_height, frame_width = frame.shape[:2]
         frame_center = np.array([frame_width / 2.0, frame_height / 2.0], dtype=float)
+        candidates: List[DebugCandidate] = []
 
         for result in results:
             boxes = getattr(result, "boxes", None)
@@ -299,11 +364,26 @@ class AutoFocusController:
                 center_y = (y1 + y2) / 2.0
                 detection_center = np.array([center_x, center_y], dtype=float)
                 distance = float(np.linalg.norm(detection_center - frame_center))
+                candidates.append(
+                    DebugCandidate(
+                        x1=float(x1),
+                        y1=float(y1),
+                        x2=float(x2),
+                        y2=float(y2),
+                        confidence=float(confidence),
+                        center_x=float(center_x),
+                        center_y=float(center_y),
+                    )
+                )
                 candidate = BoundingBox(
                     center_x=center_x,
                     center_y=center_y,
                     confidence=float(confidence),
                     distance=distance,
+                    x1=float(x1),
+                    y1=float(y1),
+                    x2=float(x2),
+                    y2=float(y2),
                 )
 
                 if best_box is None:
@@ -320,7 +400,7 @@ class AutoFocusController:
                     best_box = candidate
                     best_distance = distance
 
-        return best_box
+        return best_box, candidates
 
     def _update_cursor(self, frame: np.ndarray, box: BoundingBox) -> None:
         """Smooth the detected offset and move the cursor accordingly."""
@@ -349,31 +429,12 @@ class AutoFocusController:
         )
 
         if np.allclose(move_vector, 0.0):
-            if self.mode == "3d" and hasattr(self.cursor_controller, "moveTo"):
+            if hasattr(self.cursor_controller, "moveTo"):
                 # Maintain the pointer in the centre so relative-only inputs stay anchored.
                 self.cursor_controller.moveTo(int(self._screen_center[0]), int(self._screen_center[1]))
             return
 
-        if self.mode == "3d":
-            self._apply_3d_cursor_movement(move_vector)
-        else:
-            self._apply_2d_cursor_movement(move_vector)
-
-    def _apply_2d_cursor_movement(self, move_vector: np.ndarray) -> None:
-        """Move the cursor directly toward the detected object on the screen."""
-
-        if hasattr(self.cursor_controller, "moveRel"):
-            self.cursor_controller.moveRel(float(move_vector[0]), float(move_vector[1]))
-            return
-
-        current_position = self._get_cursor_position()
-        target_position = current_position + move_vector
-        clamped_position = np.clip(
-            target_position,
-            [0, 0],
-            [self.screen_width - 1, self.screen_height - 1],
-        )
-        self.cursor_controller.moveTo(int(clamped_position[0]), int(clamped_position[1]))
+        self._apply_3d_cursor_movement(move_vector)
 
     def _apply_3d_cursor_movement(self, move_vector: np.ndarray) -> None:
         """Send relative mouse input while keeping the pointer centred on the screen."""
@@ -388,6 +449,60 @@ class AutoFocusController:
         # next set of deltas continue from a neutral position even if the cursor is visible.
         if hasattr(self.cursor_controller, "moveTo"):
             self.cursor_controller.moveTo(int(self._screen_center[0]), int(self._screen_center[1]))
+
+    def _render_debug_frame(
+        self,
+        frame: np.ndarray,
+        candidates: List[DebugCandidate],
+        selected: Optional[BoundingBox],
+    ) -> None:
+        """Overlay detected bounding boxes in a debug window."""
+
+        if not hasattr(cv2, "imshow"):
+            return
+
+        try:
+            debug_frame = frame.copy()
+        except Exception:  # pragma: no cover - defensive copy fallback
+            return
+
+        selected_center = None
+        if selected is not None:
+            selected_center = np.array([selected.center_x, selected.center_y], dtype=float)
+
+        for candidate in candidates:
+            colour = (0, 0, 255)
+            if selected_center is not None:
+                candidate_center = np.array([candidate.center_x, candidate.center_y], dtype=float)
+                if np.linalg.norm(candidate_center - selected_center) <= 1e-6:
+                    colour = (0, 255, 0)
+
+            cv2.rectangle(
+                debug_frame,
+                (int(candidate.x1), int(candidate.y1)),
+                (int(candidate.x2), int(candidate.y2)),
+                colour,
+                2,
+            )
+
+            label = f"{candidate.confidence:.2f}"
+            cv2.putText(
+                debug_frame,
+                label,
+                (int(candidate.x1), max(int(candidate.y1) - 5, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX if hasattr(cv2, "FONT_HERSHEY_SIMPLEX") else 0,
+                0.5,
+                colour,
+                1,
+                lineType=cv2.LINE_AA if hasattr(cv2, "LINE_AA") else 16,
+            )
+
+        try:
+            cv2.imshow(self._debug_window_name, debug_frame)
+            if hasattr(cv2, "waitKey"):
+                cv2.waitKey(1)
+        except Exception:  # pragma: no cover - guard against headless environments
+            pass
 
     def _create_3d_cursor_controller(self, base_controller: object) -> object:
         """Wrap the cursor controller to prefer raw relative input when available."""
@@ -463,29 +578,49 @@ class AutoFocusController:
         return np.asarray(values, dtype=float)
 
     def _create_frame_provider(self) -> FrameProvider:
-        """Return the default frame provider capturing the primary screen."""
+        """Return the default frame provider capturing the selected screen."""
 
-        return _ScreenFrameProvider()
+        return _ScreenFrameProvider(self.monitor_index)
 
 
 class _ScreenFrameProvider:
     """Capture frames from the primary monitor for object tracking."""
 
-    def __init__(self) -> None:
+    def __init__(self, monitor_index: int = 0) -> None:
         self._monitor = None
+        self.capture_size: Optional[Tuple[int, int]] = None
         self._thread_local: Optional[threading.local] = None
         self._scts = set()
         self._scts_lock = threading.Lock()
+        self._pyautogui_region: Optional[Tuple[int, int, int, int]] = None
         if mss is not None:  # pragma: no branch - simple runtime selection
             with mss.mss() as sct:
-                monitor = sct.monitors[0]
+                monitors = list(sct.monitors)
+                index = monitor_index if 0 <= monitor_index < len(monitors) else 0
+                monitor = monitors[index]
             self._monitor = {
                 "left": monitor.get("left", 0),
                 "top": monitor.get("top", 0),
                 "width": monitor.get("width", 0),
                 "height": monitor.get("height", 0),
             }
+            self.capture_size = (
+                int(self._monitor["width"]),
+                int(self._monitor["height"]),
+            )
+            self._pyautogui_region = (
+                int(self._monitor["left"]),
+                int(self._monitor["top"]),
+                int(self._monitor["width"]),
+                int(self._monitor["height"]),
+            )
             self._thread_local = threading.local()
+        else:
+            try:
+                width, height = pyautogui.size()
+            except Exception:  # pragma: no cover - fallback when pyautogui fails
+                width, height = 0, 0
+            self.capture_size = (int(width), int(height))
 
     def __call__(self) -> Optional[np.ndarray]:
         if self._monitor is not None and self._thread_local is not None:
@@ -501,7 +636,14 @@ class _ScreenFrameProvider:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
         # Fallback to pyautogui's screenshot functionality when mss is unavailable.
-        image = pyautogui.screenshot()
+        try:
+            region = self._pyautogui_region
+            if region is not None:
+                image = pyautogui.screenshot(region=region)
+            else:
+                image = pyautogui.screenshot()
+        except Exception:  # pragma: no cover - pyautogui screenshot failure
+            return None
         frame = np.array(image)
         return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 

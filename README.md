@@ -39,9 +39,14 @@ Additional options include:
 - `--tracking-speed` to define the base movement speed (default `0.2`).
 - `--distance-ratio` to scale how much faster the cursor moves when the target is far from the center (default `2.0`).
 - `--model` to provide a custom YOLO weights file.
-- `--mode` to switch between the desktop cursor controller (`2d`, default) and a relative-input controller suited for 3D
-  applications (`3d`). The 3D mode now prefers [PyDirectInput](https://github.com/learncodebygaming/pydirectinput) when
-  available so games that capture the mouse still receive relative motion events.
+- `--monitor` to choose which display should be captured. `0` (default) observes the entire virtual desktop while higher
+  indices select a specific screen from the layout reported by the operating system.
+- `--debug-visualization` to pop up a window showing the YOLO detections used for steering. This helps debug tracking issues
+  without affecting the live cursor.
+
+The controller always emits raw relative mouse input so games that capture the pointer continue to receive motion. Ensure
+[PyDirectInput](https://github.com/learncodebygaming/pydirectinput) is installed so the events are delivered even when the
+desktop cursor is hidden.
 
 Press `Ctrl+C` to stop the controller.
 
@@ -61,6 +66,7 @@ The interface provides:
 
 - Text inputs for the target class or ID and model weights.
 - Sliders controlling the detection confidence, smoothing factor, base tracking speed, and far/near speed ratio.
-- A mode selector to choose between 2D cursor movement and 3D relative-input output for games that lock the pointer.
+- A dropdown for selecting which monitor to capture and an optional debug overlay toggle that renders the detected bounding
+  boxes.
 - Text boxes for assigning start and stop keyboard shortcuts (one or two keys separated by `+`).
 - Buttons to start/stop the controller and apply hotkey changes. Global shortcuts trigger the same actions even when the interface is not focused.
