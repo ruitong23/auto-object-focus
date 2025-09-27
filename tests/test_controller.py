@@ -301,3 +301,49 @@ def test_controller_3d_mode_falls_back_without_direct_input(monkeypatch: pytest.
     # relative delta, mirroring the legacy behaviour.
     assert any(move[0] == "rel" for move in cursor.movements)
     assert len(direct.movements) == 0
+
+
+def test_3d_mode_uses_initial_cursor_position_for_recentering(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
+
+    cursor._position = np.array([100.0, 200.0])
+
+    frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+    provider = DummyFrameProvider(frames)
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array([[400, 240, 440, 280]], dtype=float),
+                conf=np.array([0.95], dtype=float),
+                cls=np.array([0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        tracking_speed=0.2,
+        distance_ratio=1.0,
+        frame_provider=provider,
+        mode="3d",
+    )
+
+    assert np.allclose(controller._screen_center, np.array([100.0, 200.0]))
+
+    controller.run()
+
+    # Relative delta should still be emitted via the direct-input bridge.
+    assert len(direct.movements) == 1
+
+    # Pointer recentering should respect the cursor's initial position.
+    assert len(cursor.movements) == 1
+    x, y = cursor.movements[0]
+    assert pytest.approx(x, abs=1e-6) == 100.0
+    assert pytest.approx(y, abs=1e-6) == 200.0

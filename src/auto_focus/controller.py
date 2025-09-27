@@ -174,6 +174,19 @@ class AutoFocusController:
 
         self.screen_width, self.screen_height = self._normalize_screen_size(self.cursor_controller.size())
         self._screen_center = np.array([self.screen_width / 2.0, self.screen_height / 2.0], dtype=float)
+
+        if hasattr(self.cursor_controller, "position"):
+            try:
+                initial_position = self._get_cursor_position()
+            except Exception:  # pragma: no cover - defensive guard for unexpected controllers
+                initial_position = None
+            else:
+                if (
+                    isinstance(initial_position, np.ndarray)
+                    and initial_position.shape == (2,)
+                    and np.all(np.isfinite(initial_position))
+                ):
+                    self._screen_center = initial_position.astype(float)
         self._smoothed_offset = np.zeros(2, dtype=float)
         self._running = False
         self._closed = False
