@@ -33,6 +33,11 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
         "pyautogui is required to use AutoFocusController. Install the optional dependencies first."
     ) from exc
 
+try:  # pragma: no cover - optional runtime dependency
+    import pydirectinput  # type: ignore
+except ImportError:  # pragma: no cover - handled by falling back to pyautogui-only control
+    pydirectinput = None  # type: ignore[assignment]
+
 
 @dataclass
 class BoundingBox:
@@ -41,9 +46,56 @@ class BoundingBox:
     center_x: float
     center_y: float
     confidence: float
+    distance: float
 
 
 FrameProvider = Callable[[], Optional[np.ndarray]]
+
+
+class _RelativeInputAdapter:
+    """Delegate cursor actions to a base controller while using raw relative input when possible."""
+
+    def __init__(self, base_controller: object, relative_module: object) -> None:
+        self._base = base_controller
+        self._relative = relative_module
+
+    def size(self) -> Tuple[int, int]:
+        if not hasattr(self._base, "size"):
+            raise AttributeError("Base cursor controller does not expose size().")
+        return self._base.size()  # type: ignore[no-any-return]
+
+    def position(self):  # type: ignore[override]
+        if not hasattr(self._base, "position"):
+            raise AttributeError("Base cursor controller does not expose position().")
+        return self._base.position()  # type: ignore[no-any-return]
+
+    def moveTo(self, x: float, y: float) -> None:
+        mover = getattr(self._base, "moveTo", None)
+        if mover is None:
+            raise AttributeError("Base cursor controller does not expose moveTo().")
+        mover(x, y)
+
+    def moveRel(self, x: float, y: float) -> None:
+        relative_mover = getattr(self._relative, "moveRel", None)
+        if callable(relative_mover):
+            dx = int(round(x))
+            dy = int(round(y))
+            if dx == 0 and abs(x) >= 1e-6:
+                dx = 1 if x > 0 else -1
+            if dy == 0 and abs(y) >= 1e-6:
+                dy = 1 if y > 0 else -1
+            if dx == 0 and dy == 0:
+                return
+            relative_mover(dx, dy)
+            return
+
+        base_mover = getattr(self._base, "moveRel", None)
+        if base_mover is None:
+            raise AttributeError("Cursor controller does not expose moveRel().")
+        base_mover(float(x), float(y))
+
+    def __getattr__(self, item):  # pragma: no cover - defensive delegation
+        return getattr(self._base, item)
 
 
 class AutoFocusController:
@@ -74,8 +126,8 @@ class AutoFocusController:
         smoothing_factor:
             Exponential smoothing factor between 0 and 1 used to smooth cursor motion.
         tracking_speed:
-            Base relative cursor movement speed applied even when detections are close to the
-            frame centre. Expressed as a fraction of the screen size moved per update.
+            Maximum fraction of the screen size moved per update when the detection is far from
+            the frame centre. The cursor slows automatically as it approaches the target.
         distance_ratio:
             Additional scaling applied to the cursor speed based on how far the detection is
             from the centre. Larger values accelerate more aggressively when the object is far.
@@ -114,11 +166,28 @@ class AutoFocusController:
         self.smoothing_factor = smoothing_factor
         self.tracking_speed = tracking_speed
         self.distance_ratio = distance_ratio
-        self.cursor_controller = cursor_controller if cursor_controller is not None else pyautogui
         self.mode = mode_normalized
+
+        base_cursor = cursor_controller if cursor_controller is not None else pyautogui
+        if cursor_controller is None and self.mode == "3d":
+            base_cursor = self._create_3d_cursor_controller(base_cursor)
+        self.cursor_controller = base_cursor
 
         self.screen_width, self.screen_height = self._normalize_screen_size(self.cursor_controller.size())
         self._screen_center = np.array([self.screen_width / 2.0, self.screen_height / 2.0], dtype=float)
+
+        if hasattr(self.cursor_controller, "position"):
+            try:
+                initial_position = self._get_cursor_position()
+            except Exception:  # pragma: no cover - defensive guard for unexpected controllers
+                initial_position = None
+            else:
+                if (
+                    isinstance(initial_position, np.ndarray)
+                    and initial_position.shape == (2,)
+                    and np.all(np.isfinite(initial_position))
+                ):
+                    self._screen_center = initial_position.astype(float)
         self._smoothed_offset = np.zeros(2, dtype=float)
         self._running = False
         self._closed = False
@@ -196,6 +265,9 @@ class AutoFocusController:
 
         target_id = self._resolve_target_id()
         best_box: Optional[BoundingBox] = None
+        best_distance = float("inf")
+        frame_height, frame_width = frame.shape[:2]
+        frame_center = np.array([frame_width / 2.0, frame_height / 2.0], dtype=float)
 
         for result in results:
             boxes = getattr(result, "boxes", None)
@@ -225,10 +297,28 @@ class AutoFocusController:
                 x1, y1, x2, y2 = coord
                 center_x = (x1 + x2) / 2.0
                 center_y = (y1 + y2) / 2.0
-                candidate = BoundingBox(center_x=center_x, center_y=center_y, confidence=float(confidence))
+                detection_center = np.array([center_x, center_y], dtype=float)
+                distance = float(np.linalg.norm(detection_center - frame_center))
+                candidate = BoundingBox(
+                    center_x=center_x,
+                    center_y=center_y,
+                    confidence=float(confidence),
+                    distance=distance,
+                )
 
-                if best_box is None or candidate.confidence > best_box.confidence:
+                if best_box is None:
                     best_box = candidate
+                    best_distance = distance
+                    continue
+
+                if distance < best_distance - 1e-9:
+                    best_box = candidate
+                    best_distance = distance
+                    continue
+
+                if abs(distance - best_distance) <= 1e-9 and candidate.confidence > best_box.confidence:
+                    best_box = candidate
+                    best_distance = distance
 
         return best_box
 
@@ -247,8 +337,11 @@ class AutoFocusController:
         )
 
         distance_norm = float(np.linalg.norm(self._smoothed_offset))
-        effective_speed = max(0.0, self.tracking_speed + self.distance_ratio * distance_norm)
-        effective_speed = min(effective_speed, 1.0)
+        if distance_norm < 1e-9:
+            speed_scale = 0.0
+        else:
+            speed_scale = min(1.0, distance_norm * (1.0 + self.distance_ratio * distance_norm))
+        effective_speed = self.tracking_speed * speed_scale
 
         move_vector = self._smoothed_offset * effective_speed * np.array(
             [self.screen_width, self.screen_height],
@@ -295,6 +388,14 @@ class AutoFocusController:
         # next set of deltas continue from a neutral position even if the cursor is visible.
         if hasattr(self.cursor_controller, "moveTo"):
             self.cursor_controller.moveTo(int(self._screen_center[0]), int(self._screen_center[1]))
+
+    def _create_3d_cursor_controller(self, base_controller: object) -> object:
+        """Wrap the cursor controller to prefer raw relative input when available."""
+
+        if pydirectinput is None:
+            return base_controller
+
+        return _RelativeInputAdapter(base_controller, pydirectinput)
 
     def _resolve_target_id(self) -> Optional[int]:
         """Resolve the numeric class identifier for the configured target."""

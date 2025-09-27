@@ -80,7 +80,21 @@ def install_stubs(monkeypatch: pytest.MonkeyPatch):
     dummy_cursor_module.FAILSAFE = False
     monkeypatch.setitem(sys.modules, "pyautogui", dummy_cursor_module)
 
-    return DummyYOLO, cursor
+    class DummyDirectInput:
+        def __init__(self):
+            self.movements = []
+
+        def moveRel(self, x, y):
+            self.movements.append((x, y))
+
+    direct = DummyDirectInput()
+    dummy_direct_module = types.ModuleType("pydirectinput")
+    dummy_direct_module.moveRel = direct.moveRel
+    monkeypatch.setitem(sys.modules, "pydirectinput", dummy_direct_module)
+
+    sys.modules.pop("auto_focus.controller", None)
+
+    return DummyYOLO, cursor, direct
 
 
 class DummyFrameProvider:
@@ -101,7 +115,7 @@ class DummyFrameProvider:
 
 
 def test_controller_moves_cursor_with_smoothing(monkeypatch: pytest.MonkeyPatch):
-    DummyYOLO, cursor = install_stubs(monkeypatch)
+    DummyYOLO, cursor, _direct = install_stubs(monkeypatch)
 
     frames = [np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(3)]
     provider = DummyFrameProvider(frames)
@@ -153,12 +167,56 @@ def test_controller_moves_cursor_with_smoothing(monkeypatch: pytest.MonkeyPatch)
     # Cursor should move left relative to its current position to recenter the detection.
     kind, dx, dy = cursor.movements[0]
     assert kind == "rel"
-    assert pytest.approx(dx, rel=1e-3) == -153.75
+    assert pytest.approx(dx, rel=1e-3) == -12.3046875
     assert pytest.approx(dy, abs=1e-6) == 0.0
 
 
+def test_controller_prefers_box_closest_to_screen_centre(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, _direct = install_stubs(monkeypatch)
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    provider = DummyFrameProvider([frame])
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array(
+                    [
+                        [460, 180, 540, 360],  # farther from centre but highest confidence
+                        [300, 200, 360, 320],  # closest to the centre
+                    ],
+                    dtype=float,
+                ),
+                conf=np.array([0.95, 0.7], dtype=float),
+                cls=np.array([0.0, 0.0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        frame_provider=provider,
+        cursor_controller=cursor,
+        mode="2d",
+    )
+
+    selected = controller._select_target_box(frame)
+    assert selected is not None
+    # Expect the controller to lock onto the box closest to the screen centre despite the
+    # other detection having higher confidence.
+    assert pytest.approx(selected.center_x, abs=1e-6) == 330.0
+    assert pytest.approx(selected.center_y, abs=1e-6) == 260.0
+    assert selected.confidence == pytest.approx(0.7)
+
+
 def test_update_motion_parameters(monkeypatch: pytest.MonkeyPatch):
-    DummyYOLO, cursor = install_stubs(monkeypatch)
+    DummyYOLO, cursor, _direct = install_stubs(monkeypatch)
 
     frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
     provider = DummyFrameProvider(frames)
@@ -200,7 +258,7 @@ def test_update_motion_parameters(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_controller_3d_mode_recenters_pointer(monkeypatch: pytest.MonkeyPatch):
-    DummyYOLO, cursor = install_stubs(monkeypatch)
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
 
     frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
     provider = DummyFrameProvider(frames)
@@ -226,17 +284,110 @@ def test_controller_3d_mode_recenters_pointer(monkeypatch: pytest.MonkeyPatch):
         tracking_speed=0.2,
         distance_ratio=1.0,
         frame_provider=provider,
-        cursor_controller=cursor,
         mode="3d",
     )
 
+    assert isinstance(controller.cursor_controller, controller_module._RelativeInputAdapter)
+
     controller.run()
 
-    # Expect a relative move followed by a forced recenter of the pointer.
-    assert len(cursor.movements) == 2
-    kind, dx, dy = cursor.movements[0]
-    assert kind == "rel"
+    # Expect the relative delta to be sent through the direct-input bridge while the
+    # visible cursor is re-centred using the base controller.
+    assert len(direct.movements) == 1
+    dx, dy = direct.movements[0]
     assert dx != 0 or dy != 0
-    x, y = cursor.movements[1]
+
+    assert len(cursor.movements) == 1
+    x, y = cursor.movements[0]
     assert pytest.approx(x, abs=1e-6) == 960.0
     assert pytest.approx(y, abs=1e-6) == 540.0
+
+
+def test_controller_3d_mode_falls_back_without_direct_input(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
+
+    frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+    provider = DummyFrameProvider(frames)
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array([[400, 240, 440, 280]], dtype=float),
+                conf=np.array([0.95], dtype=float),
+                cls=np.array([0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    # Simulate the optional dependency being unavailable after import.
+    monkeypatch.setattr(controller_module, "pydirectinput", None, raising=False)
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        tracking_speed=0.2,
+        distance_ratio=1.0,
+        frame_provider=provider,
+        mode="3d",
+    )
+
+    assert controller_module.pydirectinput is None
+    assert not isinstance(controller.cursor_controller, controller_module._RelativeInputAdapter)
+
+    controller.run()
+
+    # With the direct-input bridge disabled the fallback controller should receive the
+    # relative delta, mirroring the legacy behaviour.
+    assert any(move[0] == "rel" for move in cursor.movements)
+    assert len(direct.movements) == 0
+
+
+def test_3d_mode_uses_initial_cursor_position_for_recentering(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, direct = install_stubs(monkeypatch)
+
+    cursor._position = np.array([100.0, 200.0])
+
+    frames = [np.zeros((480, 640, 3), dtype=np.uint8)]
+    provider = DummyFrameProvider(frames)
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array([[400, 240, 440, 280]], dtype=float),
+                conf=np.array([0.95], dtype=float),
+                cls=np.array([0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        tracking_speed=0.2,
+        distance_ratio=1.0,
+        frame_provider=provider,
+        mode="3d",
+    )
+
+    assert np.allclose(controller._screen_center, np.array([100.0, 200.0]))
+
+    controller.run()
+
+    # Relative delta should still be emitted via the direct-input bridge.
+    assert len(direct.movements) == 1
+
+    # Pointer recentering should respect the cursor's initial position.
+    assert len(cursor.movements) == 1
+    x, y = cursor.movements[0]
+    assert pytest.approx(x, abs=1e-6) == 100.0
+    assert pytest.approx(y, abs=1e-6) == 200.0
