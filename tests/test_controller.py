@@ -167,8 +167,52 @@ def test_controller_moves_cursor_with_smoothing(monkeypatch: pytest.MonkeyPatch)
     # Cursor should move left relative to its current position to recenter the detection.
     kind, dx, dy = cursor.movements[0]
     assert kind == "rel"
-    assert pytest.approx(dx, rel=1e-3) == -153.75
+    assert pytest.approx(dx, rel=1e-3) == -12.3046875
     assert pytest.approx(dy, abs=1e-6) == 0.0
+
+
+def test_controller_prefers_box_closest_to_screen_centre(monkeypatch: pytest.MonkeyPatch):
+    DummyYOLO, cursor, _direct = install_stubs(monkeypatch)
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    provider = DummyFrameProvider([frame])
+
+    controller_module = importlib.import_module("auto_focus.controller")
+    AutoFocusController = controller_module.AutoFocusController
+
+    controller_module.YOLO.result_queue = [
+        types.SimpleNamespace(
+            boxes=types.SimpleNamespace(
+                xyxy=np.array(
+                    [
+                        [460, 180, 540, 360],  # farther from centre but highest confidence
+                        [300, 200, 360, 320],  # closest to the centre
+                    ],
+                    dtype=float,
+                ),
+                conf=np.array([0.95, 0.7], dtype=float),
+                cls=np.array([0.0, 0.0], dtype=float),
+            ),
+            names={0: "person"},
+        )
+    ]
+
+    controller = AutoFocusController(
+        target_class="person",
+        confidence_threshold=0.5,
+        smoothing_factor=0.5,
+        frame_provider=provider,
+        cursor_controller=cursor,
+        mode="2d",
+    )
+
+    selected = controller._select_target_box(frame)
+    assert selected is not None
+    # Expect the controller to lock onto the box closest to the screen centre despite the
+    # other detection having higher confidence.
+    assert pytest.approx(selected.center_x, abs=1e-6) == 330.0
+    assert pytest.approx(selected.center_y, abs=1e-6) == 260.0
+    assert selected.confidence == pytest.approx(0.7)
 
 
 def test_update_motion_parameters(monkeypatch: pytest.MonkeyPatch):

@@ -2,9 +2,10 @@
 
 Automatic cursor focusing on detected objects displayed on your screen using YOLOv8.
 The controller nudges the mouse relative to its current position so the chosen object
-is guided back toward the screen centre, moving faster when the target is far away and
-slowing down as it settles. You can operate the desktop pointer directly or emit
-relative 3D-style input for games that lock the cursor to the middle of the screen.
+closest to the screen centre is guided back toward the crosshair, moving faster when
+the target is far away and slowing down as it settles. You can operate the desktop
+pointer directly or emit relative 3D-style input for games that lock the cursor to the
+middle of the screen.
 
 ## Installation
 

@@ -46,6 +46,7 @@ class BoundingBox:
     center_x: float
     center_y: float
     confidence: float
+    distance: float
 
 
 FrameProvider = Callable[[], Optional[np.ndarray]]
@@ -125,8 +126,8 @@ class AutoFocusController:
         smoothing_factor:
             Exponential smoothing factor between 0 and 1 used to smooth cursor motion.
         tracking_speed:
-            Base relative cursor movement speed applied even when detections are close to the
-            frame centre. Expressed as a fraction of the screen size moved per update.
+            Maximum fraction of the screen size moved per update when the detection is far from
+            the frame centre. The cursor slows automatically as it approaches the target.
         distance_ratio:
             Additional scaling applied to the cursor speed based on how far the detection is
             from the centre. Larger values accelerate more aggressively when the object is far.
@@ -264,6 +265,9 @@ class AutoFocusController:
 
         target_id = self._resolve_target_id()
         best_box: Optional[BoundingBox] = None
+        best_distance = float("inf")
+        frame_height, frame_width = frame.shape[:2]
+        frame_center = np.array([frame_width / 2.0, frame_height / 2.0], dtype=float)
 
         for result in results:
             boxes = getattr(result, "boxes", None)
@@ -293,10 +297,28 @@ class AutoFocusController:
                 x1, y1, x2, y2 = coord
                 center_x = (x1 + x2) / 2.0
                 center_y = (y1 + y2) / 2.0
-                candidate = BoundingBox(center_x=center_x, center_y=center_y, confidence=float(confidence))
+                detection_center = np.array([center_x, center_y], dtype=float)
+                distance = float(np.linalg.norm(detection_center - frame_center))
+                candidate = BoundingBox(
+                    center_x=center_x,
+                    center_y=center_y,
+                    confidence=float(confidence),
+                    distance=distance,
+                )
 
-                if best_box is None or candidate.confidence > best_box.confidence:
+                if best_box is None:
                     best_box = candidate
+                    best_distance = distance
+                    continue
+
+                if distance < best_distance - 1e-9:
+                    best_box = candidate
+                    best_distance = distance
+                    continue
+
+                if abs(distance - best_distance) <= 1e-9 and candidate.confidence > best_box.confidence:
+                    best_box = candidate
+                    best_distance = distance
 
         return best_box
 
@@ -315,8 +337,11 @@ class AutoFocusController:
         )
 
         distance_norm = float(np.linalg.norm(self._smoothed_offset))
-        effective_speed = max(0.0, self.tracking_speed + self.distance_ratio * distance_norm)
-        effective_speed = min(effective_speed, 1.0)
+        if distance_norm < 1e-9:
+            speed_scale = 0.0
+        else:
+            speed_scale = min(1.0, distance_norm * (1.0 + self.distance_ratio * distance_norm))
+        effective_speed = self.tracking_speed * speed_scale
 
         move_vector = self._smoothed_offset * effective_speed * np.array(
             [self.screen_width, self.screen_height],
