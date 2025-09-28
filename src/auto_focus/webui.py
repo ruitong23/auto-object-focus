@@ -19,7 +19,7 @@ except ImportError as exc:  # pragma: no cover - handled in runtime usage
         "pynput is required to use the hotkey functionality. Install the optional dependencies first."
     ) from exc
 
-from .controller import AutoFocusController
+from .controller import AutoFocusController, enumerate_monitors
 
 
 @dataclass
@@ -32,7 +32,8 @@ class AppState:
     tracking_speed: float = 0.2
     distance_ratio: float = 2.0
     model_path: str = "yolov8n.pt"
-    mode: str = "2d"
+    monitor_index: int = 0
+    debug_visualization: bool = False
     def to_controller_kwargs(self) -> dict:
         return {
             "target_class": self.target,
@@ -41,7 +42,8 @@ class AppState:
             "tracking_speed": self.tracking_speed,
             "distance_ratio": self.distance_ratio,
             "model_path": self.model_path,
-            "mode": self.mode,
+            "monitor_index": self.monitor_index,
+            "debug_visualization": self.debug_visualization,
         }
 
 
@@ -160,6 +162,21 @@ def _parse_target(value: Optional[str]) -> Optional[Union[str, int]]:
         return stripped
 
 
+def _parse_monitor_choice(value: Optional[str]) -> int:
+    if not value:
+        return 0
+    if ":" in value:
+        prefix = value.split(":", 1)[0]
+        try:
+            return int(prefix.strip())
+        except ValueError:
+            pass
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
 def launch_interface(**launch_kwargs) -> gr.Blocks:
     """Launch the Gradio interface."""
 
@@ -187,7 +204,8 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
         tracking_speed: float,
         distance_ratio: float,
         model_path: str,
-        mode: str,
+        monitor_choice: str,
+        debug_visualization: bool,
     ) -> str:
         with state_lock:
             state.target = _parse_target(target_value)
@@ -196,7 +214,8 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
             state.tracking_speed = tracking_speed
             state.distance_ratio = distance_ratio
             state.model_path = model_path.strip() or "yolov8n.pt"
-            state.mode = mode
+            state.monitor_index = _parse_monitor_choice(monitor_choice)
+            state.debug_visualization = bool(debug_visualization)
             params = state.to_controller_kwargs()
 
         success, message = runner.start(**params)
@@ -226,14 +245,28 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
             state.smoothing = smoothing
         return "Status: Updated detection thresholds."
 
-    def update_mode(mode: str) -> str:
+    def update_monitor_selection(choice: str) -> str:
         with state_lock:
-            state.mode = mode
-        return f"Status: Tracking mode set to {mode.upper()}."
+            state.monitor_index = _parse_monitor_choice(choice)
+        return "Status: Monitor selection updated."
+
+    def update_debug(enabled: bool) -> str:
+        with state_lock:
+            state.debug_visualization = bool(enabled)
+        return "Status: Debug visualisation {}.".format("enabled" if enabled else "disabled")
 
     def cleanup():  # pragma: no cover - triggered on UI shutdown
         runner.stop()
         hotkeys.shutdown()
+
+    monitor_options = enumerate_monitors()
+    if monitor_options:
+        monitor_choices = [
+            f"{entry['index']}: {entry['label']} ({entry['width']}x{entry['height']})"
+            for entry in monitor_options
+        ]
+    else:
+        monitor_choices = ["0: Primary Monitor"]
 
     with gr.Blocks(title="Auto Object Focus") as demo:
         gr.Markdown(
@@ -277,12 +310,18 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
                 label="Far/Near Speed Ratio",
             )
 
-        mode_selector = gr.Radio(
-            choices=["2d", "3d"],
-            value="2d",
-            label="Tracking Mode",
-            info="2D moves the desktop cursor, 3D emits relative input for locked-pointer apps.",
-        )
+        with gr.Row():
+            monitor_selector = gr.Dropdown(
+                choices=monitor_choices,
+                value=monitor_choices[0],
+                label="Capture Monitor",
+                info="Select which screen the detector should process.",
+            )
+            debug_checkbox = gr.Checkbox(
+                label="Show detection debug window",
+                value=False,
+                info="Overlay bounding boxes from YOLO to assist with tuning.",
+            )
 
         with gr.Row():
             start_hotkey = gr.Textbox(
@@ -310,7 +349,8 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
                 tracking_slider,
                 distance_slider,
                 model_input,
-                mode_selector,
+                monitor_selector,
+                debug_checkbox,
             ],
             outputs=status_display,
         )
@@ -330,7 +370,8 @@ def launch_interface(**launch_kwargs) -> gr.Blocks:
         smoothing_slider.change(
             update_thresholds, inputs=[confidence_slider, smoothing_slider], outputs=status_display
         )
-        mode_selector.change(update_mode, inputs=mode_selector, outputs=status_display)
+        monitor_selector.change(update_monitor_selection, inputs=monitor_selector, outputs=status_display)
+        debug_checkbox.change(update_debug, inputs=debug_checkbox, outputs=status_display)
 
     try:
         demo.launch(**launch_kwargs)
